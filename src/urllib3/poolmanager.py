@@ -4,16 +4,23 @@ import functools
 import logging
 import typing
 import warnings
+from enum import Enum
 from types import TracebackType
 from urllib.parse import urljoin
 
 from ._collections import HTTPHeaderDict, RecentlyUsedContainer
 from ._request_methods import RequestMethods
 from .connection import ProxyConfig
-from .connectionpool import HTTPConnectionPool, HTTPSConnectionPool, port_by_scheme
+from .connectionpool import (
+    HTTP2ConnectionPool,
+    HTTPConnectionPool,
+    HTTPSConnectionPool,
+    port_by_scheme,
+)
 from .exceptions import (
     LocationValueError,
     MaxRetryError,
+    ProtocolVersionError,
     ProxySchemeUnknown,
     URLSchemeUnknown,
 )
@@ -53,6 +60,15 @@ SSL_KEYWORDS = (
 # Default value for `blocksize` - a new parameter introduced to
 # http.client.HTTPConnection & http.client.HTTPSConnection in Python 3.7
 _DEFAULT_BLOCKSIZE = 16384
+
+
+class ProtocolVersion(Enum):
+    AUTO = 0
+    HTTP = 1
+    HTTP2 = 2
+
+
+_DEFAULT_PROTOCOL_VERSION = ProtocolVersion.HTTP
 
 
 class PoolKey(typing.NamedTuple):
@@ -158,7 +174,11 @@ key_fn_by_scheme = {
     "https": functools.partial(_default_key_normalizer, PoolKey),
 }
 
-pool_classes_by_scheme = {"http": HTTPConnectionPool, "https": HTTPSConnectionPool}
+pool_classes_by_version_and_scheme: dict[ProtocolVersion, dict[str, typing.Any]] = {
+    ProtocolVersion.HTTP: {"http": HTTPConnectionPool, "https": HTTPSConnectionPool},
+    ProtocolVersion.HTTP2: {"https": HTTP2ConnectionPool},
+    ProtocolVersion.AUTO: {"http": HTTPConnectionPool, "https": HTTP2ConnectionPool},
+}
 
 
 class PoolManager(RequestMethods):
@@ -202,6 +222,7 @@ class PoolManager(RequestMethods):
         self,
         num_pools: int = 10,
         headers: typing.Mapping[str, str] | None = None,
+        protocol_version: ProtocolVersion | None = None,
         **connection_pool_kw: typing.Any,
     ) -> None:
         super().__init__(headers)
@@ -223,10 +244,17 @@ class PoolManager(RequestMethods):
 
         self.pools: RecentlyUsedContainer[PoolKey, HTTPConnectionPool]
         self.pools = RecentlyUsedContainer(num_pools)
+        self.protocol_version = (
+            protocol_version
+            if protocol_version is not None
+            else _DEFAULT_PROTOCOL_VERSION
+        )
 
         # Locally set the pool classes and keys so other PoolManagers can
         # override them.
-        self.pool_classes_by_scheme = pool_classes_by_scheme
+        self.pool_classes_by_scheme = pool_classes_by_version_and_scheme[
+            self.protocol_version
+        ]
         self.key_fn_by_scheme = key_fn_by_scheme.copy()
 
     def __enter__(self) -> Self:
@@ -258,6 +286,8 @@ class PoolManager(RequestMethods):
         connection pools handed out by :meth:`connection_from_url` and
         companion methods. It is intended to be overridden for customization.
         """
+        if scheme not in self.pool_classes_by_scheme:
+            raise ProtocolVersionError("Unsupported protocol version for scheme")
         pool_cls: type[HTTPConnectionPool] = self.pool_classes_by_scheme[scheme]
         if request_context is None:
             request_context = self.connection_pool_kw.copy()

@@ -39,6 +39,7 @@ from .exceptions import (
     SSLError,
     TimeoutError,
 )
+from .http2.connection import HTTP2Connection
 from .response import BaseHTTPResponse
 from .util.connection import is_connection_dropped
 from .util.proxy import connection_requires_http_tunnel
@@ -1115,6 +1116,10 @@ class HTTPSConnectionPool(HTTPConnectionPool):
                 ),
                 InsecureRequestWarning,
             )
+
+
+class HTTP2ConnectionPool(HTTPSConnectionPool):
+    ConnectionCls: type[BaseHTTPSConnection] = HTTP2Connection
 
 
 def connection_from_url(url: str, **kw: typing.Any) -> HTTPConnectionPool:

@@ -643,6 +643,7 @@ class HTTPSConnection(HTTPConnection):
     """
 
     default_port = port_by_scheme["https"]  # type: ignore[misc]
+    alpn_protocols = ["http/1.1"]
 
     cert_reqs: int | str | None = None
     ca_certs: str | None = None
@@ -774,7 +775,7 @@ class HTTPSConnection(HTTPConnection):
         # is probing for HTTP/2 support. Otherwise, we're waiting for another
         # probe to complete, or we get a value right away.
         target_supports_http2: bool | None
-        if "h2" in ssl_.ALPN_PROTOCOLS:
+        if "h2" in self.alpn_protocols:
             target_supports_http2 = http2_probe.acquire_and_get(
                 host=probe_http2_host, port=probe_http2_port
             )
@@ -860,6 +861,7 @@ class HTTPSConnection(HTTPConnection):
                     tls_in_tls=tls_in_tls,
                     assert_hostname=self.assert_hostname,
                     assert_fingerprint=self.assert_fingerprint,
+                    alpn_protocols=self.alpn_protocols,
                 )
             self.sock = wrapped_socket
 
@@ -989,6 +991,7 @@ def _ssl_wrap_socket_and_match_hostname(
     server_hostname: str | None,
     ssl_context: ssl.SSLContext | None,
     tls_in_tls: bool = False,
+    alpn_protocols: list[str] | None = None,
 ) -> _WrappedAndVerifiedSocket:
     """Logic for constructing an SSLContext from all TLS parameters, passing
     that down into ssl_wrap_socket, and then doing certificate verification
@@ -1056,6 +1059,7 @@ def _ssl_wrap_socket_and_match_hostname(
         server_hostname=server_hostname,
         ssl_context=context,
         tls_in_tls=tls_in_tls,
+        alpn_protocols=alpn_protocols,
     )
 
     try:

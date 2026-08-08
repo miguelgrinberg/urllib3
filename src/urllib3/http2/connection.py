@@ -83,10 +83,12 @@ class _LockedObject(typing.Generic[T]):
 
 
 class HTTP2Connection(HTTPSConnection):
+    alpn_protocols = ["http/1.1", "h2"]
+
     def __init__(
         self, host: str, port: int | None = None, **kwargs: typing.Any
     ) -> None:
-        self._h2_conn = self._new_h2_conn()
+        self._h2_conn: _LockedObject[h2.connection.H2Connection] | None = None
         self._h2_stream: int | None = None
         self._headers: list[tuple[bytes, bytes]] = []
 
@@ -104,10 +106,12 @@ class HTTP2Connection(HTTPSConnection):
 
     def connect(self) -> None:
         super().connect()
-        with self._h2_conn as conn:
-            conn.initiate_connection()
-            if data_to_send := conn.data_to_send():
-                self.sock.sendall(data_to_send)
+        if self.sock.selected_alpn_protocol() == "h2":
+            self._h2_conn = self._new_h2_conn()
+            with self._h2_conn as conn:
+                conn.initiate_connection()
+                if data_to_send := conn.data_to_send():
+                    self.sock.sendall(data_to_send)
 
     def putrequest(  # type: ignore[override]
         self,
@@ -119,6 +123,9 @@ class HTTP2Connection(HTTPSConnection):
         This deviates from the HTTPConnection method signature since we never need to override
         sending accept-encoding headers or the host header.
         """
+        if not self._h2_conn:
+            return super().putrequest(method, url, **kwargs)
+
         if "skip_host" in kwargs:
             raise NotImplementedError("`skip_host` isn't supported")
         if "skip_accept_encoding" in kwargs:
@@ -141,6 +148,9 @@ class HTTP2Connection(HTTPSConnection):
             self._h2_stream = conn.get_next_available_stream_id()
 
     def putheader(self, header: str | bytes, *values: str | bytes) -> None:  # type: ignore[override]
+        if not self._h2_conn:
+            return super().putheader(header, *values)
+
         # TODO SKIPPABLE_HEADERS from urllib3 are ignored.
         header = header.encode() if isinstance(header, str) else header
         header = header.lower()  # A lot of upstream code uses capitalized headers.
@@ -154,6 +164,9 @@ class HTTP2Connection(HTTPSConnection):
             self._headers.append((header, value))
 
     def endheaders(self, message_body: typing.Any = None) -> None:  # type: ignore[override]
+        if not self._h2_conn:
+            return super().endheaders(message_body)
+
         if self._h2_stream is None:
             raise ConnectionError("Must call `putrequest` first.")
 
@@ -172,6 +185,9 @@ class HTTP2Connection(HTTPSConnection):
         `data` can be: `str`, `bytes`, an iterable, or file-like objects
         that support a .read() method.
         """
+        if not self._h2_conn:
+            return super().send(data)
+
         if self._h2_stream is None:
             raise ConnectionError("Must call `putrequest` first.")
 
@@ -226,6 +242,9 @@ class HTTP2Connection(HTTPSConnection):
     def getresponse(  # type: ignore[override]
         self,
     ) -> HTTP2Response:
+        if not self._h2_conn:
+            return super().getresponse()
+
         status = None
         data = bytearray()
         with self._h2_conn as conn:
@@ -278,6 +297,18 @@ class HTTP2Connection(HTTPSConnection):
         **kwargs: typing.Any,
     ) -> None:
         """Send an HTTP/2 request"""
+        if not self._h2_conn:
+            return super().request(
+                method,
+                url,
+                body,
+                headers,
+                preload_content=preload_content,
+                decode_content=decode_content,
+                enforce_content_length=enforce_content_length,
+                **kwargs,
+            )
+
         if "chunked" in kwargs:
             # TODO this is often present from upstream.
             # raise NotImplementedError("`chunked` isn't supported with HTTP/2")
@@ -305,6 +336,9 @@ class HTTP2Connection(HTTPSConnection):
             self.endheaders()
 
     def close(self) -> None:
+        if not self._h2_conn:
+            return super().close()
+
         with self._h2_conn as conn:
             try:
                 conn.close_connection()

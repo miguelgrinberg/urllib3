@@ -189,6 +189,10 @@ class ClosedPoolError(PoolError):
     """Raised when a request enters a pool after the pool has been closed."""
 
 
+class ProtocolVersionError(ValueError):
+    """Raised when the requested HTTP protocol version is unsupported by the pool."""
+
+
 class LocationValueError(ValueError, HTTPError):
     """Raised when there is something wrong with a given URL input."""
 
