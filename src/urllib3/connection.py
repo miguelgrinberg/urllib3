@@ -10,6 +10,7 @@ import sys
 import threading
 import typing
 import warnings
+from abc import ABC, abstractmethod
 from http.client import HTTPConnection as _HTTPConnection
 from http.client import HTTPException as HTTPException  # noqa: F401
 from http.client import ResponseNotReady
@@ -110,6 +111,254 @@ def _normalize_header_values(
     return header_items
 
 
+class BaseProtocolHelper(ABC):
+    name = "unknown"
+
+    def __init__(self, conn: HTTPConnection):
+        self.conn = conn
+
+    @abstractmethod
+    def putrequest(
+        self,
+        method: str,
+        url: str,
+        skip_host: bool = False,
+        skip_accept_encoding: bool = False,
+    ) -> None:
+        pass
+
+    @abstractmethod
+    def putheader(self, header: str, *values: str) -> None:
+        pass
+
+    @abstractmethod
+    def endheaders(self, message_body: typing.Any = None) -> None:
+        pass
+
+    @abstractmethod
+    def request(
+        self,
+        method: str,
+        url: str,
+        body: _TYPE_BODY | None = None,
+        headers: typing.Mapping[str, str] | None = None,
+        *,
+        chunked: bool = False,
+        preload_content: bool = True,
+        decode_content: bool = True,
+        enforce_content_length: bool = True,
+    ) -> None:
+        pass
+
+    @abstractmethod
+    def getresponse(self) -> HTTPResponse:
+        pass
+
+    @abstractmethod
+    def send(self, data: typing.Any) -> None:
+        pass
+
+    def close(self) -> None:
+        pass
+
+
+class HTTPProtocolHelper(BaseProtocolHelper):
+    name = "http1"
+    _response_options: _ResponseOptions | None
+
+    def __init__(self, conn: HTTPConnection):
+        super().__init__(conn)
+        self._response_options = None
+
+    def putrequest(
+        self,
+        method: str,
+        url: str,
+        skip_host: bool = False,
+        skip_accept_encoding: bool = False,
+    ) -> None:
+        match = _CONTAINS_CONTROL_CHAR_RE.search(method)
+        if match:
+            raise ValueError(
+                f"Method cannot contain non-token characters {method!r} (found at least {match.group()!r})"
+            )
+
+        return super(HTTPConnection, self.conn).putrequest(
+            method, url, skip_host=skip_host, skip_accept_encoding=skip_accept_encoding
+        )
+
+    def putheader(self, header: str, *values: str) -> None:
+        if not any(isinstance(v, str) and v == SKIP_HEADER for v in values):
+            super(HTTPConnection, self.conn).putheader(header, *values)
+        elif to_str(header.lower()) not in SKIPPABLE_HEADERS:
+            skippable_headers = "', '".join(
+                [str.title(header) for header in sorted(SKIPPABLE_HEADERS)]
+            )
+            raise ValueError(
+                f"urllib3.util.SKIP_HEADER only supports '{skippable_headers}'"
+            )
+
+    def endheaders(self, message_body: typing.Any = None) -> None:
+        super(HTTPConnection, self.conn).endheaders(message_body)
+
+    def request(
+        self,
+        method: str,
+        url: str,
+        body: _TYPE_BODY | None = None,
+        headers: typing.Mapping[str, str] | None = None,
+        *,
+        chunked: bool = False,
+        preload_content: bool = True,
+        decode_content: bool = True,
+        enforce_content_length: bool = True,
+    ) -> None:
+        # Update the inner socket's timeout value to send the request.
+        # This only triggers if the connection is re-used.
+        if self.conn.sock is not None:
+            self.conn.sock.settimeout(self.conn.timeout)
+
+        # Store these values to be fed into the HTTPResponse
+        # object later. TODO: Remove this in favor of a real
+        # HTTP lifecycle mechanism.
+
+        # We have to store these before we call .request()
+        # because sometimes we can still salvage a response
+        # off the wire even if we aren't able to completely
+        # send the request body.
+        self._response_options = _ResponseOptions(
+            request_method=method,
+            request_url=url,
+            preload_content=preload_content,
+            decode_content=decode_content,
+            enforce_content_length=enforce_content_length,
+        )
+
+        if headers is None:
+            headers = {}
+        header_keys = frozenset(to_str(k.lower()) for k in headers)
+        skip_accept_encoding = "accept-encoding" in header_keys
+        skip_host = "host" in header_keys
+        self.conn.putrequest(
+            method, url, skip_accept_encoding=skip_accept_encoding, skip_host=skip_host
+        )
+
+        # Transform the body into an iterable of sendall()-able chunks
+        # and detect if an explicit Content-Length is doable.
+        chunks_and_cl = body_to_chunks(
+            body, method=method, blocksize=self.conn.blocksize
+        )
+        chunks = chunks_and_cl.chunks
+        content_length = chunks_and_cl.content_length
+
+        # When chunked is explicit set to 'True' we respect that.
+        if chunked:
+            if "transfer-encoding" not in header_keys:
+                self.conn.putheader("Transfer-Encoding", "chunked")
+        else:
+            # Detect whether a framing mechanism is already in use. If so
+            # we respect that value, otherwise we pick chunked vs content-length
+            # depending on the type of 'body'.
+            if "content-length" in header_keys:
+                chunked = False
+            elif "transfer-encoding" in header_keys:
+                chunked = True
+
+            # Otherwise we go off the recommendation of 'body_to_chunks()'.
+            else:
+                chunked = False
+                if content_length is None:
+                    if chunks is not None:
+                        chunked = True
+                        self.conn.putheader("Transfer-Encoding", "chunked")
+                else:
+                    self.conn.putheader("Content-Length", str(content_length))
+
+        # Now that framing headers are out of the way we send all the other headers.
+        if "user-agent" not in header_keys:
+            self.conn.putheader("User-Agent", _get_default_user_agent())
+        for header, value in headers.items():
+            self.conn.putheader(header, value)
+        self.conn.endheaders()
+
+        # If we're given a body we start sending that in chunks.
+        if chunks is not None:
+            for chunk in chunks:
+                # Sending empty chunks isn't allowed for TE: chunked
+                # as it indicates the end of the body.
+                if not chunk:
+                    continue
+                if isinstance(chunk, str):
+                    chunk = chunk.encode("utf-8")
+                if chunked:
+                    self.conn.send(b"%x\r\n%b\r\n" % (len(chunk), chunk))
+                else:
+                    self.conn.send(chunk)
+
+        # Regardless of whether we have a body or not, if we're in
+        # chunked mode we want to send an explicit empty chunk.
+        if chunked:
+            self.conn.send(b"0\r\n\r\n")
+
+    def getresponse(self) -> HTTPResponse:
+        # Raise the same error as http.client.HTTPConnection
+        if self._response_options is None:
+            raise ResponseNotReady()
+
+        # Reset this attribute for being used again.
+        resp_options = self._response_options
+        self._response_options = None
+
+        # Since the connection's timeout value may have been updated
+        # we need to set the timeout on the socket.
+        self.conn.sock.settimeout(self.conn.timeout)
+
+        # This is needed here to avoid circular import errors
+        from .response import HTTPResponse
+
+        # Save a reference to the shutdown function before ownership is passed
+        # to httplib_response
+        # TODO should we implement it everywhere?
+        _shutdown = getattr(self.conn.sock, "shutdown", None)
+
+        # Get the response from http.client.HTTPConnection
+        httplib_response = super(HTTPConnection, self.conn).getresponse()
+
+        try:
+            assert_header_parsing(httplib_response.msg)
+        except (HeaderParsingError, TypeError) as hpe:
+            log.warning(
+                "Failed to parse headers (url=%s): %s",
+                _url_from_connection(self.conn, resp_options.request_url),
+                hpe,
+                exc_info=True,
+            )
+
+        header_items = _normalize_header_values(httplib_response.msg)
+        headers = HTTPHeaderDict(header_items)
+
+        response = HTTPResponse(
+            body=httplib_response,
+            headers=headers,
+            status=httplib_response.status,
+            version=httplib_response.version,
+            version_string=getattr(self.conn, "_http_vsn_str", "HTTP/?"),
+            reason=httplib_response.reason,
+            preload_content=resp_options.preload_content,
+            decode_content=resp_options.decode_content,
+            original_response=httplib_response,
+            enforce_content_length=resp_options.enforce_content_length,
+            request_method=resp_options.request_method,
+            request_url=resp_options.request_url,
+            sock_shutdown=_shutdown,
+            connection=self.conn,
+        )
+        return response
+
+    def send(self, data: typing.Any) -> None:
+        super(HTTPConnection, self.conn).send(data)
+
+
 class HTTPConnection(_HTTPConnection):
     """
     Based on :class:`http.client.HTTPConnection` but provides an extra constructor
@@ -159,7 +408,6 @@ class HTTPConnection(_HTTPConnection):
     socket_options: connection._TYPE_SOCKET_OPTIONS | None
 
     _has_connected_to_proxy: bool
-    _response_options: _ResponseOptions | None
     _tunnel_host: str | None
     _tunnel_port: int | None
     _tunnel_scheme: str | None
@@ -177,6 +425,8 @@ class HTTPConnection(_HTTPConnection):
         ) = default_socket_options,
         proxy: Url | None = None,
         proxy_config: ProxyConfig | None = None,
+        http1: bool = True,
+        http2: bool = False,
     ) -> None:
         super().__init__(
             host=host,
@@ -188,12 +438,19 @@ class HTTPConnection(_HTTPConnection):
         self.socket_options = socket_options
         self.proxy = proxy
         self.proxy_config = proxy_config
+        self.http1 = http1
+        self.http2 = http2
 
         self._has_connected_to_proxy = False
-        self._response_options = None
         self._tunnel_host: str | None = None
         self._tunnel_port: int | None = None
         self._tunnel_scheme: str | None = None
+
+        # here we start with a conservative choice of HTTP/1.1
+        # if the chosen protocol is HTTP/2 and we determine that the server
+        # supports it during the connection handshake, then this will be
+        # changed to a HTTP2ProtocolHelper
+        self._protocol_helper: BaseProtocolHelper = HTTPProtocolHelper(self)
 
     def __str__(self) -> str:
         return f"{type(self).__name__}(host={self.host!r}, port={self.port!r})"
@@ -269,6 +526,10 @@ class HTTPConnection(_HTTPConnection):
         if scheme not in ("http", "https"):
             raise ValueError(
                 f"Invalid proxy scheme for tunneling: {scheme!r}, must be either 'http' or 'https'"
+            )
+        if not self.http1:
+            raise NotImplementedError(
+                "HTTP/2 does not support setting up a tunnel through a proxy"
             )
         super().set_tunnel(host, port=port, headers=headers)
         self._tunnel_scheme = scheme
@@ -394,6 +655,17 @@ class HTTPConnection(_HTTPConnection):
                 finally:
                     response.close()
 
+    def set_protocol_options(self, http1: bool, http2: bool) -> None:
+        self.http1 = http1
+        self.http2 = http2
+        if not self.http1 and self.http2:
+            # HTTP/2 prior knowledge
+            from .http2.connection import HTTP2ProtocolHelper
+
+            self._protocol_helper = HTTP2ProtocolHelper(self)
+        else:
+            self._protocol_helper = HTTPProtocolHelper(self)
+
     def connect(self) -> None:
         self.sock = self._new_conn()
         if self._tunnel_host:
@@ -441,15 +713,16 @@ class HTTPConnection(_HTTPConnection):
 
     def close(self) -> None:
         try:
+            self._protocol_helper.close()
             super().close()
         finally:
             # Reset all stateful properties so connection
             # can be re-used without leaking prior configs.
+            self._response_options = None
             self.sock = None
             self.is_verified = False
             self.proxy_is_verified = None
             self._has_connected_to_proxy = False
-            self._response_options = None
             self._tunnel_host = None
             self._tunnel_port = None
             self._tunnel_scheme = None
@@ -464,27 +737,14 @@ class HTTPConnection(_HTTPConnection):
         """"""
         # Empty docstring because the indentation of CPython's implementation
         # is broken but we don't want this method in our documentation.
-        match = _CONTAINS_CONTROL_CHAR_RE.search(method)
-        if match:
-            raise ValueError(
-                f"Method cannot contain non-token characters {method!r} (found at least {match.group()!r})"
-            )
-
-        return super().putrequest(
-            method, url, skip_host=skip_host, skip_accept_encoding=skip_accept_encoding
-        )
+        self._protocol_helper.putrequest(method, url, skip_host, skip_accept_encoding)
 
     def putheader(self, header: str, *values: str) -> None:  # type: ignore[override]
         """"""
-        if not any(isinstance(v, str) and v == SKIP_HEADER for v in values):
-            super().putheader(header, *values)
-        elif to_str(header.lower()) not in SKIPPABLE_HEADERS:
-            skippable_headers = "', '".join(
-                [str.title(header) for header in sorted(SKIPPABLE_HEADERS)]
-            )
-            raise ValueError(
-                f"urllib3.util.SKIP_HEADER only supports '{skippable_headers}'"
-            )
+        self._protocol_helper.putheader(header, *values)
+
+    def endheaders(self, message_body: typing.Any = None) -> None:  # type: ignore[override]
+        self._protocol_helper.endheaders(message_body)
 
     # `request` method's signature intentionally violates LSP.
     # urllib3's API is different from `http.client.HTTPConnection` and the subclassing is only incidental.
@@ -500,90 +760,16 @@ class HTTPConnection(_HTTPConnection):
         decode_content: bool = True,
         enforce_content_length: bool = True,
     ) -> None:
-        # Update the inner socket's timeout value to send the request.
-        # This only triggers if the connection is re-used.
-        if self.sock is not None:
-            self.sock.settimeout(self.timeout)
-
-        # Store these values to be fed into the HTTPResponse
-        # object later. TODO: Remove this in favor of a real
-        # HTTP lifecycle mechanism.
-
-        # We have to store these before we call .request()
-        # because sometimes we can still salvage a response
-        # off the wire even if we aren't able to completely
-        # send the request body.
-        self._response_options = _ResponseOptions(
-            request_method=method,
-            request_url=url,
+        self._protocol_helper.request(
+            method,
+            url,
+            body,
+            headers,
+            chunked=chunked,
             preload_content=preload_content,
             decode_content=decode_content,
             enforce_content_length=enforce_content_length,
         )
-
-        if headers is None:
-            headers = {}
-        header_keys = frozenset(to_str(k.lower()) for k in headers)
-        skip_accept_encoding = "accept-encoding" in header_keys
-        skip_host = "host" in header_keys
-        self.putrequest(
-            method, url, skip_accept_encoding=skip_accept_encoding, skip_host=skip_host
-        )
-
-        # Transform the body into an iterable of sendall()-able chunks
-        # and detect if an explicit Content-Length is doable.
-        chunks_and_cl = body_to_chunks(body, method=method, blocksize=self.blocksize)
-        chunks = chunks_and_cl.chunks
-        content_length = chunks_and_cl.content_length
-
-        # When chunked is explicit set to 'True' we respect that.
-        if chunked:
-            if "transfer-encoding" not in header_keys:
-                self.putheader("Transfer-Encoding", "chunked")
-        else:
-            # Detect whether a framing mechanism is already in use. If so
-            # we respect that value, otherwise we pick chunked vs content-length
-            # depending on the type of 'body'.
-            if "content-length" in header_keys:
-                chunked = False
-            elif "transfer-encoding" in header_keys:
-                chunked = True
-
-            # Otherwise we go off the recommendation of 'body_to_chunks()'.
-            else:
-                chunked = False
-                if content_length is None:
-                    if chunks is not None:
-                        chunked = True
-                        self.putheader("Transfer-Encoding", "chunked")
-                else:
-                    self.putheader("Content-Length", str(content_length))
-
-        # Now that framing headers are out of the way we send all the other headers.
-        if "user-agent" not in header_keys:
-            self.putheader("User-Agent", _get_default_user_agent())
-        for header, value in headers.items():
-            self.putheader(header, value)
-        self.endheaders()
-
-        # If we're given a body we start sending that in chunks.
-        if chunks is not None:
-            for chunk in chunks:
-                # Sending empty chunks isn't allowed for TE: chunked
-                # as it indicates the end of the body.
-                if not chunk:
-                    continue
-                if isinstance(chunk, str):
-                    chunk = chunk.encode("utf-8")
-                if chunked:
-                    self.send(b"%x\r\n%b\r\n" % (len(chunk), chunk))
-                else:
-                    self.send(chunk)
-
-        # Regardless of whether we have a body or not, if we're in
-        # chunked mode we want to send an explicit empty chunk.
-        if chunked:
-            self.send(b"0\r\n\r\n")
 
     def request_chunked(
         self,
@@ -604,6 +790,9 @@ class HTTPConnection(_HTTPConnection):
         )
         self.request(method, url, body=body, headers=headers, chunked=True)
 
+    def send(self, data: typing.Any) -> None:
+        self._protocol_helper.send(data)
+
     def getresponse(  # type: ignore[override]
         self,
     ) -> HTTPResponse:
@@ -614,58 +803,7 @@ class HTTPConnection(_HTTPConnection):
 
         If a request has not been sent or if a previous response has not be handled, ResponseNotReady is raised. If the HTTP response indicates that the connection should be closed, then it will be closed before the response is returned. When the connection is closed, the underlying socket is closed.
         """
-        # Raise the same error as http.client.HTTPConnection
-        if self._response_options is None:
-            raise ResponseNotReady()
-
-        # Reset this attribute for being used again.
-        resp_options = self._response_options
-        self._response_options = None
-
-        # Since the connection's timeout value may have been updated
-        # we need to set the timeout on the socket.
-        self.sock.settimeout(self.timeout)
-
-        # This is needed here to avoid circular import errors
-        from .response import HTTPResponse
-
-        # Save a reference to the shutdown function before ownership is passed
-        # to httplib_response
-        # TODO should we implement it everywhere?
-        _shutdown = getattr(self.sock, "shutdown", None)
-
-        # Get the response from http.client.HTTPConnection
-        httplib_response = super().getresponse()
-
-        try:
-            assert_header_parsing(httplib_response.msg)
-        except (HeaderParsingError, TypeError) as hpe:
-            log.warning(
-                "Failed to parse headers (url=%s): %s",
-                _url_from_connection(self, resp_options.request_url),
-                hpe,
-                exc_info=True,
-            )
-
-        header_items = _normalize_header_values(httplib_response.msg)
-        headers = HTTPHeaderDict(header_items)
-
-        response = HTTPResponse(
-            body=httplib_response,
-            headers=headers,
-            status=httplib_response.status,
-            version=httplib_response.version,
-            version_string=getattr(self, "_http_vsn_str", "HTTP/?"),
-            reason=httplib_response.reason,
-            preload_content=resp_options.preload_content,
-            decode_content=resp_options.decode_content,
-            original_response=httplib_response,
-            enforce_content_length=resp_options.enforce_content_length,
-            request_method=resp_options.request_method,
-            request_url=resp_options.request_url,
-            sock_shutdown=_shutdown,
-        )
-        return response
+        return self._protocol_helper.getresponse()
 
 
 class HTTPSConnection(HTTPConnection):
@@ -806,7 +944,7 @@ class HTTPSConnection(HTTPConnection):
         # is probing for HTTP/2 support. Otherwise, we're waiting for another
         # probe to complete, or we get a value right away.
         target_supports_http2: bool | None
-        if "h2" in ssl_.ALPN_PROTOCOLS:
+        if self.http2 or "h2" in ssl_.ALPN_PROTOCOLS:
             target_supports_http2 = http2_probe.acquire_and_get(
                 host=probe_http2_host, port=probe_http2_port
             )
@@ -861,6 +999,12 @@ class HTTPSConnection(HTTPConnection):
             # Remove trailing '.' from fqdn hostnames to allow certificate validation
             server_hostname_rm_dot = server_hostname.rstrip(".")
 
+            alpn_protocols: list[str] = []
+            if self.http1:
+                alpn_protocols.append("http/1.1")
+            if self.http2:
+                alpn_protocols.append("h2")
+
             # Forwarding proxies should use proxy SSL context for
             # wrapping since that's the connection being established,
             # whereas tunneling proxies should use the connection's SSL
@@ -892,6 +1036,7 @@ class HTTPSConnection(HTTPConnection):
                     tls_in_tls=tls_in_tls,
                     assert_hostname=self.assert_hostname,
                     assert_fingerprint=self.assert_fingerprint,
+                    alpn_protocols=alpn_protocols,
                 )
             self.sock = wrapped_socket
 
@@ -914,11 +1059,11 @@ class HTTPSConnection(HTTPConnection):
         # If this connection doesn't know if the origin supports HTTP/2
         # we report back to the HTTP/2 probe our result.
         if target_supports_http2 is None:
-            supports_http2 = wrapped_socket.selected_alpn_protocol() == "h2"
+            target_supports_http2 = wrapped_socket.selected_alpn_protocol() == "h2"
             http2_probe.set_and_release(
                 host=probe_http2_host,
                 port=probe_http2_port,
-                supports_http2=supports_http2,
+                supports_http2=target_supports_http2,
             )
 
         # Forwarding proxies can never have a verified target since
@@ -939,6 +1084,11 @@ class HTTPSConnection(HTTPConnection):
         # establishing a tunnel.
         if self._has_connected_to_proxy and self.proxy_is_verified is None:
             self.proxy_is_verified = is_verified
+
+        if target_supports_http2:
+            from .http2.connection import HTTP2ProtocolHelper
+
+            self._protocol_helper = HTTP2ProtocolHelper(self)
 
     def _connect_tls_proxy(self, hostname: str, sock: socket.socket) -> ssl.SSLSocket:
         """
@@ -1021,6 +1171,7 @@ def _ssl_wrap_socket_and_match_hostname(
     server_hostname: str | None,
     ssl_context: ssl.SSLContext | None,
     tls_in_tls: bool = False,
+    alpn_protocols: list[str] | None = None,
 ) -> _WrappedAndVerifiedSocket:
     """Logic for constructing an SSLContext from all TLS parameters, passing
     that down into ssl_wrap_socket, and then doing certificate verification
@@ -1088,6 +1239,7 @@ def _ssl_wrap_socket_and_match_hostname(
         server_hostname=server_hostname,
         ssl_context=context,
         tls_in_tls=tls_in_tls,
+        alpn_protocols=alpn_protocols,
     )
 
     try:
