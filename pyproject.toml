@@ -55,6 +55,9 @@ socks = [
 h2 = [
   "h2>=4,<5"
 ]
+h3 = [
+  "aioquic>=1.3.0,<2"
+]
 
 [dependency-groups]
 # Shared test dependencies, excluding trustme so dev-min-pyopenssl can pin
