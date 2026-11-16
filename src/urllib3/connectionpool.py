@@ -194,6 +194,7 @@ class HTTPConnectionPool(ConnectionPool, RequestMethods):
         _proxy: Url | None = None,
         _proxy_headers: typing.Mapping[str, str] | None = None,
         _proxy_config: ProxyConfig | None = None,
+        close_active_connections: bool | None = None,
         **conn_kw: typing.Any,
     ):
         ConnectionPool.__init__(self, host, port)
@@ -209,7 +210,9 @@ class HTTPConnectionPool(ConnectionPool, RequestMethods):
         self.retries = retries
 
         self.pool: queue.LifoQueue[typing.Any] | None = self._new_pool_queue(maxsize)
+        self.active_connections: list[BaseHTTPConnection] = []
         self.block = block
+        self.close_active_connections = close_active_connections
 
         self.proxy = _proxy
         self.proxy_headers = _proxy_headers or {}
@@ -299,7 +302,9 @@ class HTTPConnectionPool(ConnectionPool, RequestMethods):
             log.debug("Resetting dropped connection: %s", self.host)
             conn.close()
 
-        return conn or self._new_conn()
+        conn = conn or self._new_conn()
+        self.active_connections.append(conn)
+        return conn
 
     def _put_conn(self, conn: BaseHTTPConnection | None) -> None:
         """
@@ -316,6 +321,11 @@ class HTTPConnectionPool(ConnectionPool, RequestMethods):
         If the pool is closed, then the connection will be closed and discarded.
         """
         if self.pool is not None:
+            try:
+                if conn:
+                    self.active_connections.remove(conn)
+            except ValueError:
+                pass
             try:
                 self.pool.put(conn, block=False)
                 return  # Everything is dandy, done.
@@ -576,6 +586,9 @@ class HTTPConnectionPool(ConnectionPool, RequestMethods):
 
         # Close all the HTTPConnections in the pool.
         _close_pool_connections(old_pool)
+        if self.close_active_connections:
+            for conn in self.active_connections:
+                conn.close()
 
     def is_same_host(self, url: str) -> bool:
         """

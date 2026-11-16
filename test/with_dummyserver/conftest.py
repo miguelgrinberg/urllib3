@@ -55,6 +55,7 @@ def pool_factory(
 ) -> PoolFactory:
     """Return a pool constructor configured for the test server."""
     pool_cls = HTTPSConnectionPool if server_scheme == "https" else HTTPConnectionPool
+    connection_pool_kw.setdefault("close_active_connections", True)
     return partial(pool_cls, **connection_pool_kw)
 
 
@@ -65,6 +66,7 @@ def pool_manager_factory(
     """
     Return a pool manager constructor configured for the test server.
     """
+    connection_pool_kw.setdefault("close_discarded_pools", True)
     return partial(PoolManager, **connection_pool_kw)
 
 

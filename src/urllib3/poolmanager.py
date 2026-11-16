@@ -174,6 +174,11 @@ key_fn_by_scheme = {
 pool_classes_by_scheme = {"http": HTTPConnectionPool, "https": HTTPSConnectionPool}
 
 
+def _close_pool(pool: HTTPConnectionPool) -> None:
+    if hasattr(pool, "close"):
+        pool.close()
+
+
 class PoolManager(RequestMethods):
     """
     Allows for arbitrary requests while transparently keeping track of
@@ -215,6 +220,7 @@ class PoolManager(RequestMethods):
         self,
         num_pools: int = 10,
         headers: typing.Mapping[str, str] | None = None,
+        close_discarded_pools: bool | None = None,
         **connection_pool_kw: typing.Any,
     ) -> None:
         super().__init__(headers)
@@ -235,7 +241,9 @@ class PoolManager(RequestMethods):
         self.connection_pool_kw = connection_pool_kw
 
         self.pools: RecentlyUsedContainer[PoolKey, HTTPConnectionPool]
-        self.pools = RecentlyUsedContainer(num_pools)
+        self.pools = RecentlyUsedContainer(
+            num_pools, dispose_func=_close_pool if close_discarded_pools else None
+        )
 
         # Locally set the pool classes and keys so other PoolManagers can
         # override them.
