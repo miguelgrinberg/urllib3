@@ -24,7 +24,7 @@ def tests_impl(
     pytest_extra_args: list[str] = [],
     dependency_group: str = "dev",
     no_default_groups: bool = False,
-    parallel: bool = True,
+    parallel: bool = False,
 ) -> None:
     # Retrieve sys info from the Python implementation under test
     # to avoid enabling memray when nox runs under CPython but tests PyPy
